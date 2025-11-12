@@ -1,3 +1,31 @@
-node_modules
+# Dependencias y build
+node_modules/
+dist/
+build/
+
+# Sesión / caché de WhatsApp Web JS
+.wwebjs_auth/
+.wwebjs_cache/
+wwebjs_auth/
+wwebjs_cache/
+
+# Entorno y secretos
 .env
-wwebjs_auth
+.env.local
+.env.*.local
+*.key
+*.pem
+
+# Logs y tmp
+logs/
+*.log
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+pnpm-debug.log*
+tmp/
+temp/
+
+# SO
+.DS_Store
+Thumbs.db

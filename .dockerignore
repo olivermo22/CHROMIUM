@@ -1,6 +1,13 @@
 node_modules
 npm-debug.log
-Dockerfile*
-.dockerignore
+yarn.lock
+pnpm-lock.yaml
+.DS_Store
+Thumbs.db
+.git
+.gitignore
 .env
-wwebjs_auth
+.wwebjs_auth
+.wwebjs_cache
+logs
+tmp

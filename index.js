@@ -1,21 +1,31 @@
 // WhatsApp (QR login) ↔ OpenAI relay — Node.js
+// Versión optimizada para menor RAM en Railway
 
 import 'dotenv/config'
 import express from 'express'
 import pkg from 'whatsapp-web.js'
-const { Client, LocalAuth, MessageMedia } = pkg
+const { Client, LocalAuth } = pkg
 import qrcodeTerminal from 'qrcode-terminal'
 import QRCode from 'qrcode'
 import OpenAI from 'openai'
 import fs from 'fs'
 
-// --- Config ---
-const PORT = process.env.PORT || 3000
+// ───────────────────────────────────────────────────────────
+// Config
+// ───────────────────────────────────────────────────────────
+const PORT = Number(process.env.PORT || 3000)
 const MODEL = process.env.OPENAI_MODEL || 'gpt-4o-mini'
-const OWNER_NUMBER = process.env.OWNER_NUMBER || '' // ej. 5217220000000
-const TEMP = parseFloat(process.env.OPENAI_TEMP ?? '0.01') // tono más natural
+const OWNER_NUMBER = (process.env.OWNER_NUMBER || '').replace(/[^\d]/g, '') // ej. 5217220000000
+const TEMP = parseFloat(process.env.OPENAI_TEMP ?? '0.01')
+const RAM_LIMIT_MB = Number(process.env.RAM_LIMIT_MB || 600)
 
-// ======== INSTRUCCIONES DEL BOT (con tono amigable) ========
+// Memoria de chat: máx 12 mensajes, TTL 30min sin actividad
+const MEM_MAX = 12
+const MEM_TTL_MS = 30 * 60 * 1000
+
+// ───────────────────────────────────────────────────────────
+// Instrucciones del bot (tu texto original)
+// ───────────────────────────────────────────────────────────
 const INSTRUCCIONES_BOT = `
 Trabajas en una Gestoría llamada "CONSULTORIA VIRTUAL" Eres un bot de servicio al cliente, tu misión es aclarar las dudas de los clientes para que puedan tramitar su licencia de conducir, actualmente contesto casi todo con respuestas rápidas, a continuación te las enumero, (tomar en cuenta que siempre busco hacer conocer de inicio las respuestas rápidas: 1,2,3 en ese orden de prioridad). las demás respuestas enumeradas son información adicional para contestar en caso de que pregunten algo.
 
@@ -184,22 +194,30 @@ En el caso de ser extranjero el requisito de la ine cambia y se requiere que el 
 Si el cliente empieza a mandar otos de los requisitos (fotos de INE, foto de la persona o firma) solicitar que primero se debe llenar la solicitud, al final hay un boton para enviarla por whatsapp en donde continuara su tramite con uno de nuestros asesores y ahi se envian las fotos.
 
 Solo en el caso de mexicanos, si no cuentan con INE, en su lugar puede presentar como requisito: copia dle ine, pasaporte, cartilla militar o cedula.
-`
+`.trim()
 
 const SYSTEM_PROMPT =
   (process.env.SYSTEM_PROMPT || 'Eres un asistente claro, útil y amigable.') +
-  '\n\n' + INSTRUCCIONES_BOT.trim()
+  '\n\n' + INSTRUCCIONES_BOT
 
-// --- OpenAI client ---
+// ───────────────────────────────────────────────────────────
+// OpenAI (singleton)
+// ───────────────────────────────────────────────────────────
 const openai = new OpenAI({ apiKey: process.env.OPENAI_API_KEY })
+if (!process.env.OPENAI_API_KEY) {
+  console.error('❌ Falta OPENAI_API_KEY en el entorno')
+  process.exit(1)
+}
 
-// --- Utilidades varias ---
+// ───────────────────────────────────────────────────────────
+// Utilidades varias
+// ───────────────────────────────────────────────────────────
 const sleep = (ms) => new Promise(res => setTimeout(res, ms))
-function isStatus(msg) { return !msg.from.endsWith('@c.us') }
-function isOwn(msg) { return msg.fromMe }
-function isGroup(msg) { return msg.from.endsWith('@g.us') }
+const isStatus = (msg) => !msg.from.endsWith('@c.us')
+const isOwn = (msg) => msg.fromMe
+const isGroup = (msg) => msg.from.endsWith('@g.us')
 
-// Auto-detección de binario Chromium (para Railway/Dockerfile)
+// Detección de binario Chromium (Railway/Docker)
 function findChrome() {
   const candidates = [
     process.env.PUPPETEER_EXECUTABLE_PATH,
@@ -213,56 +231,91 @@ function findChrome() {
 }
 const chromePath = findChrome()
 
-// ===== Fijamos una versión estable de WhatsApp Web =====
-const WA_WEB_VER = '2.2412.54' // si algún día falla, cambia por otra del repo wppconnect
+// ───────────────────────────────────────────────────────────
+// WhatsApp client
+//   - Web versión fija para estabilidad
+//   - Chromium con flags "ligeros"
+//   - Sin listeners duplicados
+// ───────────────────────────────────────────────────────────
+const WA_WEB_VER = '2.2412.54'
 
-// --- WhatsApp client ---
 const wa = new Client({
   authStrategy: new LocalAuth({
     clientId: 'session-main',
     dataPath: process.env.SESSION_DATA_PATH || './wwebjs_auth',
   }),
-
-  // Bloquea versión y usa caché remoto con ruta explícita (evita roturas)
   webVersion: WA_WEB_VER,
   webVersionCache: {
     type: 'remote',
     remotePath: `https://raw.githubusercontent.com/wppconnect-team/wa-version/main/html/${WA_WEB_VER}.html`,
   },
-
   puppeteer: {
     headless: 'new',
-    executablePath: chromePath || undefined, // en Dockerfile se fija por ENV; local puede usar el propio
+    executablePath: chromePath || undefined,
     args: [
       '--no-sandbox',
       '--disable-setuid-sandbox',
       '--disable-dev-shm-usage',
       '--disable-gpu',
+      '--disable-extensions',
+      '--disable-background-networking',
+      '--disable-default-apps',
+      '--disable-sync',
+      '--metrics-recording-only',
+      '--no-first-run',
+      '--no-zygote',
+      '--single-process',
       '--window-size=1280,800',
       '--lang=es-ES,es',
     ],
   },
 })
 
-// --- Memoria corta por chat + OpenAI helpers ---
-const MAX_MEMORY = 8
-const memory = new Map() // key: chatId, value: [{role, content}]
+// ───────────────────────────────────────────────────────────
+/** Memoria con TTL (Map) */
+// ───────────────────────────────────────────────────────────
+const memory = new Map() // key: chatId -> { ts, arr: [{role, content}] }
+
+function getNow() { return Date.now() }
+
+function getHist(chatId) {
+  const entry = memory.get(chatId)
+  if (!entry) return []
+  if (getNow() - entry.ts > MEM_TTL_MS) {
+    memory.delete(chatId)
+    return []
+  }
+  return entry.arr
+}
+
+function setHist(chatId, arr) {
+  memory.set(chatId, { ts: getNow(), arr })
+}
 
 function pushMemory(chatId, role, content) {
-  if (!memory.has(chatId)) memory.set(chatId, [])
-  const arr = memory.get(chatId)
+  const arr = getHist(chatId)
   arr.push({ role, content })
-  while (arr.length > MAX_MEMORY) arr.shift()
+  while (arr.length > MEM_MAX) arr.shift()
+  setHist(chatId, arr)
 }
 
 function buildMessages(chatId, userText) {
-  const hist = memory.get(chatId) || []
-  const messages = [{ role: 'system', content: SYSTEM_PROMPT }]
-  for (const m of hist) messages.push(m)
-  messages.push({ role: 'user', content: userText })
+  const hist = getHist(chatId)
+  const messages = [{ role: 'system', content: SYSTEM_PROMPT }, ...hist, { role: 'user', content: userText }]
   return messages
 }
 
+// Limpieza periódica de entradas expiradas
+setInterval(() => {
+  const now = getNow()
+  for (const [k, v] of memory.entries()) {
+    if (now - v.ts > MEM_TTL_MS) memory.delete(k)
+  }
+}, 5 * 60 * 1000)
+
+// ───────────────────────────────────────────────────────────
+// OpenAI helper
+// ───────────────────────────────────────────────────────────
 async function askOpenAI(chatId, userText) {
   const resp = await openai.chat.completions.create({
     model: MODEL,
@@ -275,26 +328,81 @@ async function askOpenAI(chatId, userText) {
   return answer
 }
 
-// --- QR / Ready / Auth ---
+// ───────────────────────────────────────────────────────────
+// QR / Ready / Auth / Disconnected (reinicio limpio)
+// ───────────────────────────────────────────────────────────
 let lastQRDataURL = null
-wa.on('qr', async (qr) => {
-  qrcodeTerminal.generate(qr, { small: true })
-  console.log('\nEscanea este QR desde WhatsApp → Dispositivos vinculados')
-  try { lastQRDataURL = await QRCode.toDataURL(qr, { scale: 8 }) } catch {}
-})
 
-wa.on('ready', async () => {
-  console.log('✅ WhatsApp listo')
-  if (OWNER_NUMBER) {
-    try { await wa.sendMessage(`${OWNER_NUMBER}@c.us`, '✅ Bot WhatsApp ↔ OpenAI iniciado') } catch {}
+function bindEvents() {
+  wa.removeAllListeners('qr')
+  wa.removeAllListeners('ready')
+  wa.removeAllListeners('auth_failure')
+  wa.removeAllListeners('disconnected')
+  wa.removeAllListeners('message')
+
+  wa.on('qr', async (qr) => {
+    try {
+      qrcodeTerminal.generate(qr, { small: true })
+      console.log('\nEscanea este QR desde WhatsApp → Dispositivos vinculados')
+      // Guardamos solo el ÚLTIMO (evita acumular muchos buffers)
+      lastQRDataURL = await QRCode.toDataURL(qr, { scale: 8 })
+    } catch (e) {
+      console.error('Error generando QR:', e)
+      lastQRDataURL = null
+    }
+  })
+
+  wa.on('ready', async () => {
+    console.log('✅ WhatsApp listo')
+    if (OWNER_NUMBER) {
+      try { await wa.sendMessage(`${OWNER_NUMBER}@c.us`, '✅ Bot WhatsApp ↔ OpenAI iniciado') } catch {}
+    }
+  })
+
+  wa.on('auth_failure', (m) => console.error('❌ Fallo de autenticación:', m))
+
+  // En desconexión, salimos para que Railway relance un proceso LIMPIO
+  wa.on('disconnected', async (reason) => {
+    console.warn('⚠️ Desconectado:', reason)
+    try { await wa.destroy() } catch {}
+    process.exit(0)
+  })
+
+  wa.on('message', onMessage)
+}
+
+bindEvents()
+
+// Limpieza de caché de Chromium cada 15min (reduce crecimiento de RAM)
+async function clearChromeCache() {
+  try {
+    // en wwebjs, `pupPage` puede ser promesa o propiedad ya resuelta según versión
+    const page = (await wa.pupPage) || wa.pupPage
+    if (!page?.target) return
+    const cdp = await page.target().createCDPSession()
+    await cdp.send('Network.clearBrowserCache')
+    await cdp.send('Network.clearBrowserCookies')
+    await cdp.detach()
+  } catch (_) { /* noop */ }
+}
+setInterval(clearChromeCache, 15 * 60 * 1000)
+
+// Watchdog de RAM: si supera umbral, salir para reinicio limpio
+setInterval(() => {
+  const { rss, heapUsed } = process.memoryUsage()
+  const rssMB = Math.round(rss / 1024 / 1024)
+  const heapMB = Math.round(heapUsed / 1024 / 1024)
+  console.log(`[mem] rss=${rssMB}MB heap=${heapMB}MB`)
+  if (rssMB > RAM_LIMIT_MB) {
+    console.warn(`RAM > ${RAM_LIMIT_MB}MB, exiting for clean restart`)
+    process.exit(0)
   }
-})
+}, 60 * 1000)
 
-wa.on('auth_failure', (m) => console.error('❌ Fallo de autenticación:', m))
-wa.on('disconnected', (r) => console.warn('⚠️ Desconectado:', r))
-
-// --- Mensajes entrantes ---
-wa.on('message', async (msg) => {
+// ───────────────────────────────────────────────────────────
+// Handler de mensajes
+// ───────────────────────────────────────────────────────────
+async function onMessage(msg) {
   try {
     if (isStatus(msg)) return
     if (isOwn(msg)) return
@@ -307,26 +415,32 @@ wa.on('message', async (msg) => {
     if (!text) return
 
     await chat.sendStateTyping()
+
+    // Llamada a OpenAI
     const answer = await askOpenAI(chatId, text)
 
-    // Mantén typing y espera 4s para humanizar
+    // Humaniza un poco el typing
     await chat.sendStateTyping()
     await sleep(4000)
 
-    // Envío normal (sin monoespaciado) para formato amable de WhatsApp
+    // Fragmenta por límite de WhatsApp
     const chunks = answer.match(/[\s\S]{1,3000}/g) || [answer]
     for (const ch of chunks) {
       await wa.sendMessage(from, ch, { linkPreview: false })
     }
   } catch (err) {
     console.error('Error al procesar mensaje:', err)
-    try { await wa.sendMessage(msg.from, '⚠️ Ocurrió un error procesando tu mensaje. Intenta de nuevo.', { linkPreview: false }) } catch {}
+    try {
+      await wa.sendMessage(msg.from, '⚠️ Ocurrió un error procesando tu mensaje. Intenta de nuevo.', { linkPreview: false })
+    } catch {}
   }
-})
+}
 
-// --- HTTP (health + QR viewer para Railway) ---
+// ───────────────────────────────────────────────────────────
+// HTTP (health + visor de QR para Railway)
+// ───────────────────────────────────────────────────────────
 const app = express()
-const QR_TOKEN = process.env.QR_TOKEN || '' // opcional para proteger el QR
+const QR_TOKEN = process.env.QR_TOKEN || ''
 
 app.get('/', (_, res) => res.send('OK'))
 app.get('/healthz', (_, res) => res.send('ok'))
@@ -334,10 +448,14 @@ app.get('/healthz', (_, res) => res.send('ok'))
 app.get('/qr', (req, res) => {
   if (QR_TOKEN && req.query.token !== QR_TOKEN) return res.status(401).send('Unauthorized')
   if (!lastQRDataURL) return res.status(404).send('QR no disponible')
-  const b64 = lastQRDataURL.split(',')[1]
-  const img = Buffer.from(b64, 'base64')
-  res.setHeader('Content-Type', 'image/png')
-  res.send(img)
+  try {
+    const b64 = lastQRDataURL.split(',')[1]
+    const img = Buffer.from(b64, 'base64')
+    res.setHeader('Content-Type', 'image/png')
+    res.send(img)
+  } catch {
+    res.status(500).send('QR inválido')
+  }
 })
 
 app.get('/scan', (req, res) => {
@@ -347,5 +465,7 @@ app.get('/scan', (req, res) => {
 
 app.listen(PORT, () => console.log(`HTTP listo en :${PORT}`))
 
-// --- Inicia ---
+// ───────────────────────────────────────────────────────────
+// Inicio
+// ───────────────────────────────────────────────────────────
 wa.initialize()
