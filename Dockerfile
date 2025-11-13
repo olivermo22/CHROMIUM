@@ -1,8 +1,10 @@
-FROM ghcr.io/puppeteer/puppeteer:22-jammy
-WORKDIR /app
+# Usa la imagen oficial de Puppeteer con Chrome ya instalado
+FROM ghcr.io/puppeteer/puppeteer:latest
 
+WORKDIR /app
 COPY package*.json ./
-RUN npm ci --omit=dev
+# usa ci si tienes package-lock.json; si no, cambia a "npm install --omit=dev"
+RUN npm ci --omit=dev || npm install --omit=dev
 
 COPY . .
 ENV PUPPETEER_EXECUTABLE_PATH=/usr/bin/google-chrome
